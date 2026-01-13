@@ -1,0 +1,536 @@
+---
+title: "Data_Science"
+author: "Archit Das and Shalini Bhaiya"
+date: "2025-05-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(stargazer)
+library(stringr)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(modelsummary)
+library(forcats)
+
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE
+)
+```
+
+## Loading Datasets
+Using Question Hour Dataset from TCPD, Muslim MP Counts Dataset from Prof Hilal Ahmed himself, India Democracy Dataset from V-Dem, and Unique Member datset which is us manually coding whether MPs are Muslims or not
+
+```{r ,warning=FALSE, message=FALSE}
+setwd("D:/Ashoka University/Spring'25/Data Science/End Term Project/Datasets")
+
+dataset <- read_tsv("TCPD_QH.tsv")
+vdem_india<- read.csv("India_Dem.csv")
+members_info <- read.csv("unique_members_tagged.csv", stringsAsFactors = FALSE)
+```
+
+## Cleaning the TCPD Dataset for Muslims
+```{r ,warning=FALSE, message=FALSE}
+# Fix constituency names
+dataset <- dataset %>%
+  mutate(
+    constituency = str_replace_all(constituency, "Coochbehar\\(sc\\), District, Coochbehar", "Coochbehar (SC) District Coochbehar"),
+    constituency = str_replace_all(constituency, "Shahdol\\(st\\), District, Anooppur", "Shahdol (ST) District Anooppur")
+  )
+
+# Expand multiple values into rows
+dataset <- dataset %>%
+  mutate(
+    member_split = str_split(member, ",\\s*"),
+    party_split = str_split(party, ",\\s*"),
+    state_split = str_split(state, ",\\s*"),
+    constituency_split = str_split(constituency, ",\\s*"),
+    type_split = str_split(constituency_type, ",\\s*"),
+    gender_split = str_split(gender, ",\\s*")
+  ) %>%
+  mutate(row_id = row_number()) %>%
+  unnest(cols = c(member_split, party_split, state_split, constituency_split, type_split, gender_split)) %>%
+  select(-member, -party, -state, -constituency, -constituency_type, -gender) %>%
+  rename(
+    member = member_split,
+    party = party_split,
+    state = state_split,
+    constituency = constituency_split,
+    constituency_type = type_split,
+    gender = gender_split
+  )
+
+# Extract year and identify ruling party
+dataset <- dataset %>%
+  mutate(year = year(date)) %>%
+  mutate(party_in_power = case_when(
+    year > 2014 ~ "BJP",
+    year > 2004 & year <= 2014 ~ "INC",
+    year > 1999 & year <= 2004 ~ "BJP",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(same_as_ruling = if_else(party == party_in_power, TRUE, FALSE))
+  
+# Merge with Muslim tagging info
+dataset <- dataset %>%
+  mutate(date = ymd(date),
+         year = year(date),
+         month = format(date, "%m"))
+
+ruling_data <- dataset %>%
+  group_by(year, month, same_as_ruling) %>%
+  summarise(
+    avg_questions = n() / n_distinct(member),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    date = as.Date(paste(year, month, "15", sep = "-")),
+    group = if_else(same_as_ruling, "Ruling Party", "Opposition")
+  )
+```
+
+## Graph 1: Average Questions Asked per MP by Ruling vs Opposition
+```{r ,warning=FALSE, message=FALSE}
+ggplot(ruling_data, aes(x = date, y = avg_questions, color = group)) +
+  geom_line(size = 0.8) +
+  scale_color_manual(values = c("Ruling Party" = "#1b9e77", "Opposition" = "#d95f02")) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title = "Average Questions Asked per MP by Ruling vs Opposition",
+    x = "Year",
+    y = "Average Questions per MP",
+    color = "Party Status"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top")
+```
+
+## Create Muslim MP data
+```{r ,warning=FALSE, message=FALSE}
+dataset <- dataset %>% left_join(members_info, by = c("member" = "name")) %>% select(-X)
+
+muslim_questions <- dataset %>% filter(is_muslim == TRUE) %>% mutate(date = ymd(date), month = format(date, "%m"))
+
+# Add Muslim MP counts manually
+muslim_mp_counts <- tribble(
+  ~year, ~muslim_mp_count,
+  1999, 32,
+  2004, 35,
+  2009, 28,
+  2014, 23,
+  2019, 26
+)
+
+# Fill missing years
+date_years <- tibble(year = min(muslim_questions$year):max(muslim_questions$year))
+muslim_mp_counts <- date_years %>% left_join(muslim_mp_counts, by = "year") %>% arrange(year) %>% fill(muslim_mp_count, .direction = "down")
+
+# Compute monthly Muslim MP question rates
+monthly_question_counts <- muslim_questions %>%
+  group_by(year, month) %>%
+  summarise(muslim_question_count = n(), .groups = "drop")
+
+muslim_monthly_data <- monthly_question_counts %>%
+  left_join(muslim_mp_counts, by = "year") %>%
+  mutate(questions_per_muslim_mp = muslim_question_count / muslim_mp_count)
+
+merged_data <- muslim_questions %>%
+  left_join(muslim_monthly_data, by = c("year", "month")) %>%
+  left_join(vdem_india, by = "year")
+```
+
+## Cleaning the TCPD Dataset for Non-Muslims
+```{r ,warning=FALSE, message=FALSE}
+# Non-Muslim Analysis
+non_muslim_questions <- dataset %>% 
+  filter(is_muslim == FALSE) %>% 
+  mutate(date = ymd(date), month = format(date, "%m"), year = year(date))
+
+
+monthly_non_muslim_counts <- non_muslim_questions %>%
+  group_by(year, month) %>%
+  summarise(non_muslim_question_count = n(), .groups = "drop")
+
+non_muslim_mp_counts <- muslim_mp_counts %>%
+  mutate(non_muslim_mp_count = 543 - muslim_mp_count)
+
+non_muslim_monthly_data <- monthly_non_muslim_counts %>%
+  left_join(non_muslim_mp_counts %>% select(year, non_muslim_mp_count), by = "year") %>%
+  mutate(questions_per_non_muslim_mp = non_muslim_question_count / non_muslim_mp_count)
+
+merged_data <- merged_data %>%
+  left_join(non_muslim_monthly_data %>% select(year, month, questions_per_non_muslim_mp), by = c("year", "month"))
+```
+
+## Average Questions per State-Year
+```{r ,warning=FALSE, message=FALSE}
+# Add average questions per state-year
+state_year_avg <- dataset %>%
+  group_by(state, year) %>%
+  summarise(total_questions = n(), total_mps = n_distinct(member), .groups = "drop") %>%
+  mutate(avg_questions_state_year = total_questions / total_mps)
+
+```
+
+## Questions Asked per Muslim and Non-Muslim MP from (1999-2019)
+```{r ,warning=FALSE, message=FALSE}
+merged_data <- merged_data %>%
+  left_join(state_year_avg, by = c("state", "year"))
+
+plot_time_data <- merged_data %>%
+  group_by(year, month) %>%
+  summarise(
+    muslim = mean(questions_per_muslim_mp, na.rm = TRUE),
+    non_muslim = mean(questions_per_non_muslim_mp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(date = as.Date(paste(year, month, "15", sep = "-")))
+```
+
+## Graph 2: Questions Asked per Muslim and Non-Muslim MP from (1999-2019)
+```{r ,warning=FALSE, message=FALSE}
+ggplot(plot_time_data, aes(x = date)) +
+  geom_line(aes(y = muslim, color = "Muslim MPs"), size = 0.9) +
+  geom_line(aes(y = non_muslim, color = "Non-Muslim MPs"), size = 0.7) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title = "Monthly Average Questions per MP: Muslim vs Non-Muslim",
+    x = "Year",
+    y = "Questions per MP",
+    caption= "Source: TCPD Question Hour Dataset",
+    color = "MP Group"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+ggsave("1.png")
+```
+
+## Questions Asked per Non-Muslim MP from (1999-2019)
+```{r ,warning=FALSE, message=FALSE}
+state_subset <- state_year_avg %>%
+  filter(state %in% c("Tamil Nadu", "Uttar Pradesh"))
+```
+
+## Graph 3: Average Questions per MP: Tamil Nadu vs Uttar Pradesh (1999-2019)
+```{r ,warning=FALSE, message=FALSE}
+ggplot(state_subset, aes(x = year, y = avg_questions_state_year, color = state, group = state)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(
+    title = "Average Questions per MP: Tamil Nadu vs Uttar Pradesh (1999-2019)",
+    x = "Year",
+    y = "Average Questions per MP",
+    caption = "Source: TCPD Question Hour Dataset"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )
+ggsave("2.png")
+```
+
+## Monthly Difference in Questions per MP
+```{r ,warning=FALSE, message=FALSE}
+# Calculate and plot monthly difference 
+plot_diff_data <- merged_data %>%
+  group_by(year, month) %>%
+  summarise(
+    muslim = mean(questions_per_muslim_mp, na.rm = TRUE),
+    non_muslim = mean(questions_per_non_muslim_mp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    date = as.Date(paste(year, month, "15", sep = "-")),
+    net_difference = muslim - non_muslim
+  )
+```
+
+## Graph 4: Net Monthly Difference in Questions per MP (Muslim − Non-Muslim)
+```{r ,warning=FALSE, message=FALSE}
+ggplot(plot_diff_data, aes(x = date, y = net_difference)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkred") +
+  geom_line(color = "#2c3e50", size = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, color = "#1f78b4", linetype = "solid", size = 1) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title = "Net Monthly Difference in Questions per MP (Muslim − Non-Muslim)",
+    subtitle = "Using LOESS Trend Line",
+    x = "Year",
+    y = "Difference in Questions per MP",
+    caption = "Source: TCPD Question Hour Dataset"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave("3.png")
+```
+
+## Regressions
+```{r ,warning=FALSE, message=FALSE}
+plot_vars <- list("v2xca_academ" = "Academic Freedom Index (D)",
+                    "v2cacritic" = "Academics as critics (C)",
+                    "v2xcl_acjst" = "Access to justice (D)",
+                    "v2peapssoc" = "Access to public services distributed by social group (C)",
+                    "v2peapsecon" = "Access to public services distributed by socio-economic position (C)",
+                    "v2peasbepol" = "Access to state business opportunities by political group (C)",
+                    "v2peasbsoc" = "Access to state business opportunities by social group (C)",
+                    "v2peasjpol" = "Access to state jobs by political group (C)",
+                    "v2peasjsoecon" = "Access to state jobs by socio-economic position (C)",
+                    "v2x_accountability" = "Accountability index (D)",
+                    "v2xme_altinf" = "Alternative sources of information index (D)",
+                    "v2x_civlib" = "Civil liberties index (D)",
+                    "v2x_cspart" = "Civil society participation index (D)",
+                    "v2xdl_delib" = "Deliberative component index (D)",
+                    "v2x_delibdem" = "Deliberative democracy index (D)",
+                    "v2x_diagacc" = "Diagonal accountability index (D)",
+                    "v2psplats" = "Distinct party platforms (C)",
+                    "v2peedueq" = "Educational equality (C)",
+                    "v2xeg_eqaccess" = "Equal access index (D)",
+                    "v2xeg_eqprotec" = "Equal protection index (D)",
+                    "v2xcl_rol" = "Equality before the law and individual liberty index (D)",
+                    "v2xpe_exlpol" = "Exclusion by Political Group index (D)",
+                    "v2xpe_exlsocgr" = "Exclusion by Social Group index (D)",
+                    "v2xpe_exlecon" = "Exclusion by Socio-Economic Group (D)",
+                    "v2xpe_exlgeo" = "Exclusion by Urban-Rural Location index (D)",
+                    "v2x_execorr" = "Executive corruption index (D)",
+                    "v2exembez" = "Executive embezzlement and theft (C)",
+                    "v2clkill" = "Freedom from political killings (C)",
+                    "v2clacfree" = "Freedom of academic and cultural expression (C)",
+                    "v2cafexch" = "Freedom of academic exchange and dissemination (C)",
+                    "v2x_frassoc_thick" = "Freedom of association thick index (D)",
+                    "v2xcl_disc" = "Freedom of discussion (D)",
+                    "v2x_freexp" = "Freedom of expression index (D)",
+                    "v2caassemb" = "Freedom of peaceful assembly (C)",
+                    "v2clrelig" = "Freedom of religion (C)",
+                    "v2cafres" = "Freedom to research and teach (C)",
+                    "v2xpas_democracy_government" = "Government Coalition Democracy Index (D)",
+                    "v2xpas_exclusion_government" = "Government Coalition Party-System Exclusion Index (D)",
+                    "v2xpas_religion_government" = "Government Coalition Religion Index (D)",
+                    "v2smgovshutcap" = "Government Internet shut down capacity (C)",
+                    "v2jupoatck" = "Government attacks on judiciary (C)",
+                    "v2mecenefm" = "Government censorship effort — Media (C)",
+                    "v2meharjrn" = "Harassment of journalists (C)",
+                    "v2pehealth" = "Health equality (C)",
+                    "v2x_horacc" = "Horizontal accountability index (D)",
+                    "v2juaccnt" = "Judicial accountability (C)",
+                    "v2x_jucon" = "Judicial constraints on the executive index (D)",
+                    "v2jupurge" = "Judicial purges (C)",
+                    "v2xlg_legcon" = "Legislative constraints on the executive index (D)",
+                    "v2lgqstexp" = "Legislature questions officials in practice (C)",
+                    "v2x_libdem" = "Liberal democracy index (D)",
+                    "v2cagenmob" = "Mass mobilization (C)",
+                    "v2caconmob" = "Mass mobilization concentration (C)",
+                    "v2mebias" = "Media bias (C)",
+                    "v2meslfcen" = "Media self-censorship (C)",
+                    "v2caautmob" = "Mobilization for autocracy (C)",
+                    "v2psnatpar" = "National party control (C)",
+                    "v2x_neopat" = "Neopatrimonial Rule Index (D)",
+                    "v2xpas_democracy_opposition" = "Opposition Parties Democracy Index (D)",
+                    "v2xpas_exclusion_opposition" = "Opposition Parties Party-System Exclusion Index (D)",
+                    "v2xpas_religion_opposition" = "Opposition Parties Religion Index (D)",
+                    "v2x_partipdem" = "Participatory democracy index (D)",
+                    "v2smparab" = "Party dissemination of false information abroad (C)",
+                    "v2smpardom" = "Party dissemination of false information domestic (C)",
+                    "v2psprlnks" = "Party linkages (C)",
+                    "v2xpas_democracy" = "Party-System Democracy Index (D)",
+                    "v2xpas_exclusion" = "Party-System Exclusion Index (D)",
+                    "v2xpas_religion" = "Party-System Religion Index (D)",
+                    "v2exl_legitperf" = "Performance legitimation (C)",
+                    "v2cacamps" = "Political polarization (C)",
+                    "v2caviol" = "Political violence (C)",
+                    "v2merange" = "Print/broadcast media perspectives (C)",
+                    "v2regimpoppgroup" = "Regime most important opposition group (C)",
+                    "v2csrlgrep" = "Religious organization repression (C)",
+                    "v2x_rule" = "Rule of law index (D)",
+                    "v2x_ex_party" = "Ruling party dimension index (D)",
+                    "v2pesecsch" = "Secondary school enrolment (A)",
+                    "v2clacjust" = "Social class equality in respect for civil liberty (C)",
+                    "v2regantireg" = "Strongest anti-regime preferences (C)")
+
+plot_vars <- plot_vars[!duplicated(names(plot_vars))]
+
+beta_results <- data.frame(
+  Variable = character(),
+  Label = character(),
+  Beta = numeric(),
+  P_value = numeric(),
+  CI_Lower = numeric(),
+  CI_Upper = numeric(),
+  stringsAsFactors = FALSE
+)
+model_list <- list()
+
+for (var in names(plot_vars)) {
+  label <- plot_vars[[var]]
+  cat("Processing:", var, "-", label, "\n")
+  
+  if (!(var %in% colnames(merged_data))) {
+    cat("  Skipping:", var, "- not found in dataset.\n")
+    next
+  }
+  
+  reg_data <- merged_data %>%
+    select(questions_per_muslim_mp, v2xel_elecparl, same_as_ruling, questions_per_non_muslim_mp,
+           avg_questions_state_year, !!sym(var), year, month) %>%
+    rename(predictor = !!sym(var)) %>%
+    drop_na()
+  
+  if (!is.numeric(reg_data$predictor)) {
+    cat("  Skipping:", var, "- predictor is not numeric.\n")
+    next
+  }
+  
+  if (nrow(reg_data) < 10) next
+  
+  Q1_q <- quantile(reg_data$questions_per_muslim_mp, 0.25)
+  Q3_q <- quantile(reg_data$questions_per_muslim_mp, 0.75)
+  IQR_q <- IQR(reg_data$questions_per_muslim_mp)
+  
+  Q1_r <- quantile(reg_data$predictor, 0.25)
+  Q3_r <- quantile(reg_data$predictor, 0.75)
+  IQR_r <- IQR(reg_data$predictor)
+  
+  reg_data_clean <- reg_data %>%
+    filter(questions_per_muslim_mp > (Q1_q - 1.75 * IQR_q) & questions_per_muslim_mp < (Q3_q + 1.75 * IQR_q)) %>%
+    filter(predictor > (Q1_r - 1.75 * IQR_r) & predictor < (Q3_r + 1.75 * IQR_r))
+  
+  if (nrow(reg_data_clean) < 10) next
+  
+  reg_data_clean <- reg_data_clean %>%
+    mutate(
+      y_resid = resid(lm(questions_per_muslim_mp ~ v2xel_elecparl + same_as_ruling +
+                           questions_per_non_muslim_mp + avg_questions_state_year, data = .)),
+      x = resid(lm(predictor ~ v2xel_elecparl + same_as_ruling +
+                     questions_per_non_muslim_mp + avg_questions_state_year, data = .))
+    ) %>%
+    drop_na(x, y_resid)
+  
+  if (nrow(reg_data_clean) < 10) next
+  
+  final_model <- lm(scale(y_resid) ~ scale(x), data = reg_data_clean)
+  beta <- coef(summary(final_model))[2, "Estimate"]
+  p_val <- coef(summary(final_model))[2, "Pr(>|t|)"]
+  conf_int <- confint(final_model)[2, ]
+  
+  beta_results <- rbind(beta_results,
+                        data.frame(
+                          Variable = var,
+                          Label = label,
+                          Beta = beta,
+                          P_value = p_val,
+                          IQR = IQR_r, 
+                          CI_Lower = conf_int[1],
+                          CI_Upper = conf_int[2],
+                          stringsAsFactors = FALSE
+                        ))
+  model_list[[var]] <- final_model
+  
+  cat("  Beta:", round(beta, 3), "| P-value:", signif(p_val, 3), 
+      "| CI:", paste0("[", round(conf_int[1], 3), ", ", round(conf_int[2], 3), "]"), "\n")
+   if (var %in% c("v2xpas_religion_government", "v2csrlgrep","v2xeg_eqprotec", "v2x_horacc","v2xcl_disc")){
+  # #--- Plot ---
+    reg_data_clean$year <- as.factor(reg_data_clean$year)
+    
+    print(
+      ggplot(reg_data_clean, aes(x = x, y = y_resid, color = year)) +
+        geom_point(alpha = 0.6, size = 2) +
+        geom_smooth(method = "lm", se = TRUE, color = "black") +
+        scale_color_manual(values = colorRampPalette(c("lightblue", "darkblue"))(length(unique(reg_data_clean$year)))) +
+        labs(
+          title = paste("Residualized Relationship:", label),
+          x = paste(label, "(Residualized)"),
+          y = "Muslim MP Questions (Residualized)",
+          color = "Year"
+        ) +
+        theme_minimal()
+    )
+
+  }
+}
+selected_vars <- c("v2xpas_exclusion", "v2xpas_democracy_government", "v2xpas_religion_government", "v2csrlgrep",
+                 "v2xeg_eqprotec","v2xpas_democracy", "v2x_horacc", "v2xpas_exclusion_government", "v2xcl_disc" )
+for (var in selected_vars) {
+  label <- plot_vars[[var]]
+  cat("Running stargazer regression for:", var, "-", label, "\n")
+  
+  if (!(var %in% colnames(merged_data))) {
+    cat("  Skipping:", var, "- not found in dataset.\n")
+    next
+  }
+  
+  reg_data <- merged_data %>%
+    select(questions_per_muslim_mp, v2xel_elecparl, same_as_ruling, questions_per_non_muslim_mp, avg_questions_state_year,
+           !!sym(var), year, month) %>%
+    rename(predictor = !!sym(var)) %>%
+    drop_na()
+  
+  if (!is.numeric(reg_data$predictor)) {
+    cat("  Skipping:", var, "- predictor is not numeric.\n")
+    next
+  }
+  
+  model <- lm(questions_per_muslim_mp ~ predictor + v2xel_elecparl + same_as_ruling + questions_per_non_muslim_mp + avg_questions_state_year, data = reg_data)
+  
+  # Print to console (text)
+  stargazer(
+    model,
+    type = "text",
+    title = paste("Regression Output for", label),
+    out = paste0("stargazer_", var, ".txt")
+  )
+}
+# === Final Plot for Significant Results Only (p < 0.05 AND CI does not include 0) ===
+beta_plot_data <- beta_results %>%
+  filter(
+    !is.na(P_value),
+    P_value > 0,
+    P_value < 0.05,
+    !(CI_Lower < 0 & CI_Upper > 0),           # Exclude unreliable estimates
+    abs(Beta) > 0.15,
+    IQR > 0.01
+  ) %>%
+  group_by(Label) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  mutate(      # Wrap labels for readability
+    Label = fct_reorder(Label, Beta)          # Reorder after wrapping
+  )
+# Only plot if we have results
+if (nrow(beta_plot_data) > 0) {
+  if (nrow(beta_plot_data) > 0) {
+    ggplot(beta_plot_data, aes(x = fct_reorder(Label, Beta), y = Beta, fill = Beta > 0)) +
+      geom_col() +
+      coord_flip() +
+      geom_text(aes(label = round(Beta, 2), hjust = ifelse(Beta > 0, -0.1, 1.1)), size = 3) +
+      scale_fill_manual(values = c("TRUE" = "forestgreen", "FALSE" = "tomato")) + 
+      scale_y_continuous(expand = expansion(mult = c(0.01, 0.05)))+
+      labs(
+        title = "Significant Beta Coefficients with Reliable 95% Confidence Intervals",
+        x = NULL,
+        y = "Beta"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9),
+        legend.position = "none"
+      )
+} else {
+  cat("No significant beta coefficients with reliable confidence intervals to plot.\n")
+}}
+
+
+write.csv(beta_plot_data, "beta")
+```
